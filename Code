@@ -1,0 +1,260 @@
+from __future__ import annotations
+
+import json
+import os
+import re
+from pathlib import Path
+from typing import Any
+from urllib.parse import urlparse
+
+import pandas as pd
+from dotenv import load_dotenv
+
+
+ARTIFACTS_DIR = Path("artifacts")
+ARTIFACTS_DIR.mkdir(exist_ok=True)
+
+
+def env_bool(name: str, default: bool) -> bool:
+    raw = os.getenv(name, str(default)).strip().lower()
+    return raw in {"1", "true", "yes", "y", "on"}
+
+
+def require_env(name: str) -> str:
+    value = os.getenv(name, "").strip()
+    if not value:
+        raise ValueError(f"Missing required environment variable: {name}")
+    return value
+
+
+def normalize_foundry_base_url(endpoint: str) -> str:
+    endpoint = endpoint.rstrip("/")
+    parsed = urlparse(endpoint)
+    host = parsed.netloc.lower()
+
+    if "services.ai.azure.com" in host:
+        return f"{parsed.scheme}://{parsed.netloc}/models"
+    if "openai.azure.com" in host:
+        return f"{parsed.scheme}://{parsed.netloc}/openai/v1"
+    return endpoint
+
+
+def build_llm(provider: str):
+    from langchain_openai import AzureChatOpenAI, ChatOpenAI
+
+    if provider == "foundry":
+        endpoint = require_env("FOUNDRY_ENDPOINT")
+        api_key = require_env("FOUNDRY_API_KEY")
+        model = require_env("FOUNDRY_MODEL")
+        base_url = normalize_foundry_base_url(endpoint)
+
+        print("Provider: foundry")
+        print("Foundry base URL:", base_url)
+        print("Foundry model:", model)
+
+        return ChatOpenAI(
+            model=model,
+            api_key=api_key,
+            base_url=base_url,
+            temperature=0.2,
+            max_tokens=700,
+        )
+
+    if provider == "azure":
+        endpoint = require_env("AZURE_OPENAI_ENDPOINT")
+        api_key = require_env("AZURE_OPENAI_API_KEY")
+        api_version = require_env("AZURE_OPENAI_API_VERSION")
+        deployment = require_env("AZURE_OPENAI_CHAT_DEPLOYMENT")
+
+        print("Provider: azure")
+        print("Azure endpoint:", endpoint)
+        print("Azure deployment:", deployment)
+        print("Azure API version:", api_version)
+
+        return AzureChatOpenAI(
+            azure_endpoint=endpoint,
+            azure_deployment=deployment,
+            api_version=api_version,
+            api_key=api_key,
+            temperature=0.2,
+            max_tokens=700,
+        )
+
+    if provider == "openai":
+        api_key = require_env("OPENAI_API_KEY")
+        model = os.getenv("OPENAI_MODEL", "gpt-4.1-mini").strip()
+
+        print("Provider: openai")
+        print("OpenAI model:", model)
+
+        return ChatOpenAI(
+            model=model,
+            api_key=api_key,
+            temperature=0.2,
+            max_tokens=700,
+        )
+
+    raise ValueError("LLM_PROVIDER must be one of: foundry, azure, openai")
+
+
+def extract_json_object(text: str) -> dict[str, Any]:
+    text = text.strip()
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        match = re.search(r"\{.*\}", text, flags=re.DOTALL)
+        if not match:
+            raise
+        return json.loads(match.group(0))
+
+
+def create_canvas_prompt(product_idea: str) -> str:
+    return f"""
+Create a Mini Lean AI Canvas for this product idea:
+
+{product_idea}
+
+Return strict JSON with this exact shape:
+{{
+  "user_customer": ["bullet 1", "bullet 2"],
+  "problem": ["bullet 1", "bullet 2"],
+  "ai_solution_mvp": ["bullet 1", "bullet 2"],
+  "success_metric": ["bullet 1", "bullet 2"],
+  "biggest_assumption_next_test": ["bullet 1", "bullet 2"]
+}}
+
+Rules:
+- Use only the five sections above.
+- Keep each bullet short.
+- Make assumptions clear.
+- Do not pretend there is evidence unless the product idea provides it.
+""".strip()
+
+
+def generate_canvas(llm, use_llm: bool, prompt: str, sample_canvas: dict[str, Any]) -> dict[str, Any]:
+    if not use_llm:
+        return sample_canvas
+
+    from langchain_core.messages import HumanMessage, SystemMessage
+
+    response = llm.invoke(
+        [
+            SystemMessage(content="You are a concise product strategist. Return only valid JSON."),
+            HumanMessage(content=prompt),
+        ]
+    )
+    raw_canvas = str(response.content)
+    print(raw_canvas)
+    return extract_json_object(raw_canvas)
+
+
+def canvas_to_dataframe(canvas: dict[str, Any]) -> pd.DataFrame:
+    section_names = {
+        "user_customer": "User / Customer",
+        "problem": "Problem",
+        "ai_solution_mvp": "AI Solution / MVP",
+        "success_metric": "Success Metric",
+        "biggest_assumption_next_test": "Biggest Assumption / Next Test",
+    }
+
+    rows: list[dict[str, str]] = []
+    for key, title in section_names.items():
+        bullets = canvas.get(key, [])
+        if isinstance(bullets, str):
+            bullets = [bullets]
+
+        rows.append(
+            {
+                "section": title,
+                "ai_draft": "\n".join(f"- {bullet}" for bullet in bullets),
+                "review_label": "assumption",
+                "class_notes": "",
+            }
+        )
+
+    return pd.DataFrame(rows)
+
+
+def create_miro_text(canvas_df: pd.DataFrame) -> str:
+    lines = []
+    for _, row in canvas_df.iterrows():
+        lines.append(f"{row['section']}\n{row['ai_draft']}\nLabel: {row['review_label']}")
+    return "\n\n---\n\n".join(lines)
+
+
+def export_artifacts(product_idea: str, canvas_df: pd.DataFrame, miro_text: str) -> None:
+    csv_path = ARTIFACTS_DIR / "mini_lean_canvas_for_miro.csv"
+    md_path = ARTIFACTS_DIR / "mini_lean_canvas_for_miro.md"
+    txt_path = ARTIFACTS_DIR / "miro_paste_text.txt"
+
+    canvas_df.to_csv(csv_path, index=False)
+
+    md_lines = ["# Mini Lean AI Canvas", "", f"Product idea: {product_idea}", ""]
+    for _, row in canvas_df.iterrows():
+        md_lines.extend(
+            [f"## {row['section']}", row["ai_draft"], "", f"Review label: {row['review_label']}", ""]
+        )
+
+    md_path.write_text("\n".join(md_lines), encoding="utf-8")
+    txt_path.write_text(miro_text, encoding="utf-8")
+
+    print("Wrote:", csv_path)
+    print("Wrote:", md_path)
+    print("Wrote:", txt_path)
+
+
+def main() -> None:
+    load_dotenv(override=True)
+
+    use_llm = env_bool("USE_LLM", True)
+    provider = os.getenv("LLM_PROVIDER", "azure").strip().lower()
+    llm = build_llm(provider) if use_llm else None
+
+    product_idea = (
+        "An AI assistant that helps small medical clinics reduce missed appointments by sending reminders, "
+        "answering basic scheduling questions, and escalating complex cases to front-desk staff."
+    )
+
+    sample_canvas = {
+        "user_customer": [
+            "Small medical clinics with high appointment no-show rates.",
+            "Front-desk staff who spend time on reminders and scheduling questions.",
+        ],
+        "problem": [
+            "Missed appointments reduce revenue and delay patient care.",
+            "Staff time is consumed by repetitive scheduling communication.",
+        ],
+        "ai_solution_mvp": [
+            "Send automated appointment reminders and answer common scheduling questions.",
+            "Escalate complex or sensitive cases to front-desk staff.",
+        ],
+        "success_metric": [
+            "Reduce no-show rate for the pilot patient group.",
+            "Track staff handoffs, patient satisfaction, and reminder response rate.",
+        ],
+        "biggest_assumption_next_test": [
+            "Assumption: patients will trust and respond to AI scheduling messages.",
+            "Next test: run a small pilot and compare no-show rate against a baseline.",
+        ],
+    }
+
+    canvas_prompt = create_canvas_prompt(product_idea)
+    canvas = generate_canvas(llm, use_llm, canvas_prompt, sample_canvas)
+    canvas_df = canvas_to_dataframe(canvas)
+
+    canvas_df.loc[canvas_df["section"] == "User / Customer", "review_label"] = "assumption"
+    canvas_df.loc[canvas_df["section"] == "Success Metric", "review_label"] = "evidence_needed"
+    canvas_df.loc[canvas_df["section"] == "Biggest Assumption / Next Test", "review_label"] = "next_test"
+
+    miro_text = create_miro_text(canvas_df)
+
+    print("\nReview table:")
+    print(canvas_df.to_string(index=False))
+    print("\nMiro paste text:")
+    print(miro_text)
+
+    export_artifacts(product_idea, canvas_df, miro_text)
+
+
+if __name__ == "__main__":
+    main()
